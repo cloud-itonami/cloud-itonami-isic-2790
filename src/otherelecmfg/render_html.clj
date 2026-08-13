@@ -1,0 +1,661 @@
+(ns otherelecmfg.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 for this repo: there was previously
+  NO demo page and no generator at all. This namespace drives the REAL
+  actor stack (`otherelecmfg.operation` -> `otherelecmfg.governor` ->
+  `otherelecmfg.phase` -> `otherelecmfg.store`) over the langgraph
+  StateGraph (`langgraph.graph/run*`, the same entry
+  `otherelecmfg.sim` uses) and renders the resulting store + audit
+  ledger. EVERY cell on the page is real run output: batch/equipment
+  fields come from `otherelecmfg.store`'s own seed, hold reasons are
+  the governor's own `:detail` strings, and the phase table is read out
+  of `otherelecmfg.phase/phases` itself. Nothing here is hand-typed
+  domain prose.
+
+  Scenario (see `run-demo!`) deliberately reaches every disposition the
+  actor can produce -- auto-commit, escalate->approve->commit,
+  escalate->REJECT->hold, phase-gate hold, and all TWELVE of the
+  governor's HARD rules, including both branches of the
+  shipment-quantity check (over-capacity AND un-checkable) and the
+  exact-fill boundary that `shipment-quantity-exceeded?` treats as
+  legal.
+
+  Determinism: no timestamps, no random ids, no map-iteration-order
+  dependence (every fold is over a sorted seq). Two consecutive runs
+  against the same seed are byte-identical.
+
+  Build-time invariants (`-main` THROWS rather than emit a page that
+  claims something the run did not produce):
+    - at least one `:governor-hold` fact,
+    - every one of the twelve declared HARD rules actually fired,
+    - a commit, an approval-granted and an approval-rejected happened,
+    - the phase gate actually held something,
+    - every equipment/batch id referenced by a rendered draft exists in
+      the store.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
+            [otherelecmfg.advisor :as advisor]
+            [otherelecmfg.governor :as governor]
+            [otherelecmfg.operation :as op]
+            [otherelecmfg.phase :as phase]
+            [otherelecmfg.store :as store]
+            [langgraph.graph :as g]))
+
+;; ----------------------------- scenario driving -----------------------------
+
+(def ^:private coordinator
+  "Phase-3 (supervised-auto) plant coordinator -- the default context."
+  {:actor-id "coord-1" :actor-role :plant-coordinator :phase 3})
+
+(def ^:private intake-only-coordinator
+  "The SAME coordinator at phase 1 (assisted-intake), used to show the
+  rollout phase gate holding an op the governor itself cleared."
+  (assoc coordinator :phase 1))
+
+(def ^:private declared-hard-rules
+  "The twelve HARD rules `otherelecmfg.governor/check` can raise. The
+  scenario below must exercise every one -- `-main` throws otherwise,
+  so the page's coverage claim cannot rot into a lie."
+  [:not-propose-effect
+   :unknown-op
+   :equipment-control-blocked
+   :equipment-actuate-blocked
+   :certification-authority-blocked
+   :equipment-not-verified
+   :already-scheduled
+   :batch-not-verified
+   :shipment-quantity-exceeded
+   :invalid-product-type
+   :invalid-insulation-resistance-mohm
+   :invalid-defect-rate])
+
+(defn- rogue-advisor
+  "A deliberately COMPROMISED advisor: it answers a perfectly ordinary
+  `:schedule-maintenance` request with a hallucinated direct
+  equipment-control effect (`:assembler/actuate`) that is outside
+  `otherelecmfg.governor/allowed-proposal-effects`.
+
+  This is the only way to exercise `:equipment-control-blocked` on its
+  own -- the honest `otherelecmfg.advisor` never emits an effect
+  outside the closed allowlist, so via that path the rule only ever
+  co-fires with `:unknown-op`. Running it proves the governor censors
+  the intelligence node itself, not merely malformed callers."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _st req]
+      {:summary    (str (:subject req) " 向け保守作業予定提案 (advisor が直接操作効果を提案)")
+       :rationale  "この advisor は許可リスト外の効果を宣言している (侵害された助言者の模擬)"
+       :cites      []
+       :effect     :assembler/actuate
+       :value      (:value req)
+       :stake      nil
+       :confidence 0.95})))
+
+(defn- exec!
+  ([actor tid request] (exec! actor tid request coordinator))
+  ([actor tid request context]
+   (g/run* actor {:request request :context context} {:thread-id tid})))
+
+(defn- resume!
+  [actor tid status]
+  (g/run* actor {:approval {:status status :by "coord-1"}}
+          {:thread-id tid :resume? true}))
+
+(defn run-demo!
+  "Drives one freshly-seeded store through the full scenario and
+  returns `{:db .. :runs [..]}`, where `:runs` keeps each graph run's
+  final state so the renderer can join the run's own `:audit` channel
+  (which carries the approver) against what the store actually
+  retained.
+
+  Clean path: a production-batch patch auto-commits at phase 3; a
+  maintenance window on the verified/registered assembly station, a
+  safety-concern flag, a within-quantity shipment and an EXACT-fill
+  shipment each escalate to a human and are approved. Then a second
+  safety concern is REJECTED by the approver, and a shipment the
+  governor itself cleared is held by the phase-1 rollout gate. Finally
+  every HARD rule is exercised one request at a time -- the 'exercise
+  the failure mode directly, never only via a happy path' discipline
+  this repo's own `otherelecmfg.sim` follows."
+  []
+  (let [db (-> (store/mem-store) (store/sample-data!))
+        actor (op/build db)
+        rogue (op/build db {:advisor (rogue-advisor)})
+        runs (atom [])
+        record! (fn [label tid state] (swap! runs conj {:label label :tid tid :state (:state state)}) state)]
+
+    ;; ---- clean path -------------------------------------------------
+    (record! "生産バッチ記録 (phase-3 自動コミット)" "t1"
+             (exec! actor "t1"
+                    {:op :log-production-batch :effect :propose :subject "batch-001"
+                     :patch {:product-type :welding-equipment :last-assessed "2026-07-14"}}))
+
+    (exec! actor "t2"
+           {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+            :value {:equipment-id "assembler-001" :maintenance-type :contact-inspection
+                    :scheduled-date "2026-08-01" :actuate-equipment? false}})
+    (record! "保守作業予定 mnt-1 (承認済み)" "t2" (resume! actor "t2" :approved))
+
+    (exec! actor "t3"
+           {:op :flag-safety-concern :effect :propose :subject "concern-1"
+            :value {:equipment-id "assembler-001" :severity :moderate
+                    :description "溶接機出力端子の絶縁劣化兆候、通電試験時の異音"}})
+    (record! "安全懸念 concern-1 (承認済み)" "t3" (resume! actor "t3" :approved))
+
+    (exec! actor "t4"
+           {:op :coordinate-shipment :effect :propose :subject "ship-1"
+            :value {:batch-id "batch-001" :units 50.0 :destination "buyer-yard-north"}})
+    (record! "出荷調整 ship-1 (数量内 / 承認済み)" "t4" (resume! actor "t4" :approved))
+
+    ;; batch-002 は生産数量 200 に対し出荷実績 180 -- 残り 20 台ちょうどの
+    ;; 出荷は「超過」ではない (registry/shipment-quantity-exceeded? の
+    ;; 端数丸め境界)。この 1 件が丁度ぴったりの充填を通す証拠になる。
+    (exec! actor "t5"
+           {:op :coordinate-shipment :effect :propose :subject "ship-2"
+            :value {:batch-id "batch-002" :units 20.0 :destination "buyer-yard-west"}})
+    (record! "出荷調整 ship-2 (残数ちょうど / 承認済み)" "t5" (resume! actor "t5" :approved))
+
+    ;; ---- human REJECTS ----------------------------------------------
+    (exec! actor "t6"
+           {:op :flag-safety-concern :effect :propose :subject "concern-2"
+            :value {:equipment-id "test-bench-002" :severity :low
+                    :description "試験ベンチの校正記録が古い可能性"}})
+    (record! "安全懸念 concern-2 (承認者が却下)" "t6" (resume! actor "t6" :rejected))
+
+    ;; ---- rollout phase gate (governor clean, phase 1 では書けない) ----
+    (record! "出荷調整 ship-3 @ phase 1 (段階ゲートで保留)" "t7"
+             (exec! actor "t7"
+                    {:op :coordinate-shipment :effect :propose :subject "ship-3"
+                     :value {:batch-id "batch-001" :units 10.0 :destination "buyer-yard-north"}}
+                    intake-only-coordinator))
+
+    ;; ---- HARD holds, one request per rule ---------------------------
+    (record! "HARD: 要求の :effect が :propose でない" "t8"
+             (exec! actor "t8"
+                    {:op :log-production-batch :effect :direct-write :subject "batch-001"
+                     :patch {:product-type :welding-equipment}}))
+
+    (record! "HARD: 未知の操作" "t9"
+             (exec! actor "t9"
+                    {:op :actuate-assembly-line :effect :propose :subject "batch-001"}))
+
+    (record! "HARD: 侵害された advisor の設備直接操作提案" "t10"
+             (exec! rogue "t10"
+                    {:op :schedule-maintenance :effect :propose :subject "mnt-9"
+                     :value {:equipment-id "assembler-001" :maintenance-type :contact-inspection
+                             :scheduled-date "2026-08-01"}}))
+
+    (record! "HARD: 未検証・未登録の設備への保守作業予定" "t11"
+             (exec! actor "t11"
+                    {:op :schedule-maintenance :effect :propose :subject "mnt-2"
+                     :value {:equipment-id "test-bench-002" :maintenance-type :calibration
+                             :scheduled-date "2026-08-01" :actuate-equipment? false}}))
+
+    (record! "HARD: 未検証・未登録のバッチからの出荷" "t12"
+             (exec! actor "t12"
+                    {:op :coordinate-shipment :effect :propose :subject "ship-4"
+                     :value {:batch-id "batch-003" :units 100.0 :destination "buyer-yard-south"}}))
+
+    ;; ship-2 で batch-002 は生産数量ちょうどまで出荷済み。あと 1 台で超過する。
+    (record! "HARD: 生産数量を超える出荷 (残数 0 に +1 台)" "t13"
+             (exec! actor "t13"
+                    {:op :coordinate-shipment :effect :propose :subject "ship-5"
+                     :value {:batch-id "batch-002" :units 1.0 :destination "buyer-yard-east"}}))
+
+    ;; 申請数量が数値として確定しない -- 検算できないものは空き容量ではない。
+    (record! "HARD: 空き容量を検算できない出荷申請" "t14"
+             (exec! actor "t14"
+                    {:op :coordinate-shipment :effect :propose :subject "ship-6"
+                     :value {:batch-id "batch-001" :destination "buyer-yard-north"}}))
+
+    (record! "HARD: 設備の直接操作(actuate)提案" "t15"
+             (exec! actor "t15"
+                    {:op :schedule-maintenance :effect :propose :subject "mnt-3"
+                     :value {:equipment-id "assembler-001" :maintenance-type :force-run
+                             :scheduled-date "2026-09-01" :actuate-equipment? true}}))
+
+    (record! "HARD: 同一保守作業の二重予定" "t16"
+             (exec! actor "t16"
+                    {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+                     :value {:equipment-id "assembler-001" :maintenance-type :contact-inspection
+                             :scheduled-date "2026-08-01" :actuate-equipment? false}}))
+
+    (record! "HARD: 未知の product-type" "t17"
+             (exec! actor "t17"
+                    {:op :log-production-batch :effect :propose :subject "batch-001"
+                     :patch {:product-type :unobtainium}}))
+
+    (record! "HARD: 物理的に妥当でない絶縁抵抗値" "t18"
+             (exec! actor "t18"
+                    {:op :log-production-batch :effect :propose :subject "batch-001"
+                     :patch {:insulation-resistance-mohm 999999999.0}}))
+
+    (record! "HARD: 物理的に妥当でない不良率" "t19"
+             (exec! actor "t19"
+                    {:op :log-production-batch :effect :propose :subject "batch-001"
+                     :patch {:defect-rate-percent 999.0}}))
+
+    (record! "HARD: 電気安全認証の自己発行" "t20"
+             (exec! actor "t20"
+                    {:op :log-production-batch :effect :propose :subject "batch-001"
+                     :patch {:issue-certification? true}}))
+
+    {:db db :runs @runs}))
+
+;; ----------------------------- derived views -----------------------------
+
+(defn- esc [v]
+  (-> (if (nil? v) "" (str v))
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
+
+(defn- nm
+  "Render a keyword/string uniformly (basis vectors mix both)."
+  [x]
+  (cond (nil? x) "" (keyword? x) (name x) :else (str x)))
+
+(defn- audit-facts
+  "Every audit fact produced across every run, in run order."
+  [runs]
+  (vec (mapcat #(get-in % [:state :audit]) runs)))
+
+(defn- approvals-from-audit
+  "subject -> approver, taken from the runs' own `:approval-granted`
+  audit facts. This is the ONLY place the approver's identity survives
+  (see `approver-retention` below)."
+  [runs]
+  (into (sorted-map)
+        (keep (fn [f] (when (= :approval-granted (:t f)) [(:subject f) (:by f)]))
+              (audit-facts runs))))
+
+(defn- approver-retention
+  "DERIVED at render time -- never hard-coded. Walks the store's own
+  registers (the entities a commit actually wrote) and asks whether the
+  approver key `:approved-by` is present on them, then compares that
+  against the approvals the run's audit channel recorded.
+
+  `otherelecmfg.operation`'s approval path puts the approver at
+  `[:record :payload :approved-by]`, but
+  `otherelecmfg.store/commit-record!` destructures only
+  `{:keys [effect path value]}` -- it never reads `:payload`. So today
+  `:in-record` is 0 while `:in-audit` is non-zero. If that seam is ever
+  fixed the counts move on their own and this page corrects itself; a
+  hard-coded note would have become a lie the day someone fixed it."
+  [db runs]
+  (let [approvals (approvals-from-audit runs)
+        committed (concat (store/all-maintenance db)
+                          (keep #(store/shipment db (get % "shipment_id")) (store/shipment-history db))
+                          (store/safety-concerns db))
+        approved-entities (filter #(contains? approvals (:id %)) committed)]
+    {:approvals approvals
+     :in-audit (count approvals)
+     :approved-entities (vec (sort-by :id approved-entities))
+     :in-record (count (filter #(contains? % :approved-by) approved-entities))}))
+
+(defn- approver-cell
+  "Attribution for one committed entity. Never silently omits the
+  approver: if the record kept it, say so; if only the audit fact has
+  it, name the approver AND say the record did not retain it, so a
+  reader can tell 'nobody approved' apart from 'the store dropped it'."
+  [approvals {:keys [id] :as entity}]
+  (cond
+    (contains? entity :approved-by)
+    (str "<span class=\"ok\">" (esc (:approved-by entity)) "</span> <span class=\"muted\">(記録に保持)</span>")
+
+    (contains? approvals id)
+    (str "<span class=\"warn\">" (esc (get approvals id)) "</span> "
+         "<span class=\"muted\">(監査ファクト由来 &mdash; 記録には残っていない)</span>")
+
+    :else "<span class=\"muted\">&mdash;</span>"))
+
+(defn- holds
+  "Every HARD-hold fact the run wrote to the store ledger."
+  [db]
+  (filterv #(= :governor-hold (:t %)) (store/ledger db)))
+
+(defn- rule-coverage
+  "rule -> {:count n :subjects [..] :detail <the governor's own text>}
+  built from the ledger, sorted by rule name. The detail column is the
+  governor's own `:detail` string, not a paraphrase."
+  [db]
+  (into (sorted-map)
+        (for [[rule vs] (group-by :rule (mapcat :violations (holds db)))]
+          [rule {:count (count vs)
+                 :detail (:detail (first vs))
+                 :subjects (vec (sort (distinct (for [h (holds db)
+                                                      v (:violations h)
+                                                      :when (= rule (:rule v))]
+                                                  (:subject h)))))}])))
+
+(defn- last-fact-for [ledger subject]
+  (last (filter #(= (:subject %) subject) ledger)))
+
+(defn- status-cell [ledger subject]
+  (let [f (last-fact-for ledger subject)]
+    (cond
+      (nil? f) "<span class=\"muted\">活動なし</span>"
+      (= :committed (:t f)) "<span class=\"ok\">コミット済み</span>"
+      (= :approval-rejected (:t f)) "<span class=\"warn\">承認者が却下</span>"
+      (= :governor-hold (:t f))
+      (let [rule (-> f :violations first :rule)]
+        (str "<span class=\"critical\">HARD hold &middot; "
+             (esc (nm (or rule (:phase-reason f) :unknown))) "</span>"))
+      :else "<span class=\"muted\">進行中</span>")))
+
+;; ----------------------------- table rows -----------------------------
+
+(defn- row [& cells]
+  (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+
+(defn- flag [b] (if b "<span class=\"ok\">true</span>" "<span class=\"critical\">false</span>"))
+
+(defn- num [v] (str "<span class=\"num\">" (esc v) "</span>"))
+
+(defn- batch-row [ledger {:keys [id product-type model insulation-resistance-mohm
+                                 quantity-units shipped-units defect-rate-percent
+                                 verified? registered? last-assessed]}]
+  (row (str "<code>" (esc id) "</code>") (esc (nm product-type)) (esc model)
+       (num insulation-resistance-mohm) (num quantity-units) (num shipped-units)
+       (num defect-rate-percent) (flag verified?) (flag registered?)
+       (esc last-assessed) (status-cell ledger id)))
+
+(defn- equipment-row [{:keys [id kind verified? registered? last-maintenance-date
+                              last-scheduled-maintenance-date]}]
+  (row (str "<code>" (esc id) "</code>") (esc (nm kind)) (flag verified?) (flag registered?)
+       (if last-maintenance-date (esc last-maintenance-date) "<span class=\"muted\">&mdash;</span>")
+       (if last-scheduled-maintenance-date
+         (esc last-scheduled-maintenance-date)
+         "<span class=\"muted\">&mdash;</span>")))
+
+(defn- maintenance-row [approvals {:keys [id equipment-id maintenance-type scheduled-date
+                                          maintenance-number scheduled?] :as m}]
+  (row (str "<code>" (esc id) "</code>") (str "<code>" (esc equipment-id) "</code>")
+       (esc (nm maintenance-type)) (esc scheduled-date)
+       (str "<code>" (esc maintenance-number) "</code>") (flag scheduled?)
+       (approver-cell approvals m)))
+
+(defn- shipment-row [approvals {:keys [id batch-id units destination shipment-number] :as s}]
+  (row (str "<code>" (esc id) "</code>") (str "<code>" (esc batch-id) "</code>")
+       (num units) (esc destination)
+       (str "<code>" (esc shipment-number) "</code>")
+       (approver-cell approvals s)))
+
+(defn- concern-row [approvals {:keys [id equipment-id severity description] :as c}]
+  (row (str "<code>" (esc id) "</code>")
+       (if equipment-id (str "<code>" (esc equipment-id) "</code>") "<span class=\"muted\">&mdash;</span>")
+       (esc (nm severity)) (esc description) (approver-cell approvals c)))
+
+(defn- phase-row [[n {:keys [label writes auto]}]]
+  (row (num n) (esc label)
+       (if (seq writes)
+         (str/join " " (map #(str "<code>" (esc (nm %)) "</code>") (sort-by nm writes)))
+         "<span class=\"muted\">(書き込み不可)</span>")
+       (if (seq auto)
+         (str/join " " (map #(str "<code>" (esc (nm %)) "</code>") (sort-by nm auto)))
+         "<span class=\"muted\">(自動コミットなし &mdash; 全件人間承認)</span>")))
+
+(defn- rule-row [[rule {:keys [count detail subjects]}]]
+  (row (str "<code>" (esc (nm rule)) "</code>")
+       (str "<span class=\"critical\">" (num count) " 回</span>")
+       (str/join " " (map #(str "<code>" (esc %) "</code>") subjects))
+       (esc detail)))
+
+(defn- ledger-row [{:keys [t op subject disposition basis phase-reason phase confidence]}]
+  (row (esc (nm t)) (str "<code>" (esc (nm (or op :n-a))) "</code>") (esc subject)
+       (esc (nm disposition))
+       (if (seq basis)
+         (str/join ", " (map #(str "<code>" (esc (nm %)) "</code>") basis))
+         (if phase-reason
+           (str "<code>" (esc (nm phase-reason)) "</code> <span class=\"muted\">@ phase "
+                (esc phase) "</span>")
+           "<span class=\"muted\">&mdash;</span>"))
+       (if (nil? confidence) "<span class=\"muted\">&mdash;</span>" (num confidence))))
+
+(defn- draft-row [r]
+  (row (str "<code>" (esc (get r "record_id")) "</code>")
+       (esc (get r "kind"))
+       (str "<code>" (esc (or (get r "maintenance_id") (get r "shipment_id"))) "</code>")
+       (if (get r "equipment_id") (str "<code>" (esc (get r "equipment_id")) "</code>")
+           "<span class=\"muted\">&mdash;</span>")
+       (flag (get r "immutable"))))
+
+(defn- run-row [ledger {:keys [label tid state]}]
+  (let [{:keys [request disposition]} state]
+    (row (str "<code>" (esc tid) "</code>") (esc label)
+         (str "<code>" (esc (nm (:op request))) "</code>")
+         (str "<code>" (esc (:subject request)) "</code>")
+         (esc (nm disposition))
+         (status-cell ledger (:subject request)))))
+
+;; ----------------------------- document -----------------------------
+
+(defn- section [title lead headers rows]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" title "</h2>\n"
+       "    <p class=\"muted\">" lead "</p>\n"
+       "    <table>\n"
+       "      <thead><tr>" (str/join (map #(str "<th>" % "</th>") headers)) "</tr></thead>\n"
+       "      <tbody>\n"
+       (str/join "\n" rows) "\n"
+       "      </tbody>\n"
+       "    </table>\n"
+       "  </section>\n"))
+
+(defn render
+  "Renders the whole operator console from a store `db` that has
+  already been driven by `run-demo!` (plus that call's `runs`)."
+  [{:keys [db runs]}]
+  (let [ledger (vec (store/ledger db))
+        {:keys [approvals in-audit in-record approved-entities]} (approver-retention db runs)
+        shipments (->> (store/shipment-history db)
+                       (map #(get % "shipment_id"))
+                       sort
+                       (keep #(store/shipment db %)))
+        coverage (rule-coverage db)
+        hold-count (count (holds db))
+        commit-count (count (filter #(= :committed (:t %)) ledger))]
+    (str
+     "<!doctype html>\n<html lang=\"ja\"><head><meta charset=\"utf-8\">\n"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+     "<title>cloud-itonami-isic-2790 &middot; other-electrical-equipment plant operations</title>\n"
+     "<style>\n" (jp-go-dds.skin/dds+skin) "\n</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>電気機器その他 (ISIC 2790) 製造プラント運用 &mdash; オペレーターコンソール</h1>\n"
+     "  <span class=\"badge\">read-only サンプル &middot; governor-gated &middot; 設備の直接操作と認証自己発行は恒久禁止</span>\n"
+     "</header>\n"
+     "<main>\n"
+     "  <p class=\"subtitle\">このページは <code>clojure -M:dev:render-html</code> が実際の actor "
+     "(<code>otherelecmfg.operation</code> &rarr; <code>otherelecmfg.governor</code> &rarr; "
+     "<code>otherelecmfg.store</code>) を langgraph StateGraph 上で走らせ、その出力だけから生成しています。"
+     "手書きの数値・固有名は 1 つもありません。今回の走行: "
+     "<span class=\"num\">" (count runs) "</span> シナリオ / "
+     "<span class=\"num\">" commit-count "</span> コミット / "
+     "<span class=\"num\">" hold-count "</span> HARD hold / "
+     "<span class=\"num\">" (count coverage) "</span> 種の governor 規則が発火。</p>\n"
+
+     (section "生産バッチ (SSoT)"
+              (str "<code>otherelecmfg.store</code> の生産バッチ台帳。<code>verified?</code>/"
+                   "<code>registered?</code> は QC 検査済み・生産台帳登録済みの実facts で、"
+                   "governor が助言者の言い分を信用せず独立に読み直す対象です。"
+                   "<code>shipped-units</code> は走行後の値 (出荷コミットで実際に増えています)。")
+              ["バッチ" "product-type" "型式" "絶縁抵抗 MΩ" "生産数量" "出荷済み" "不良率 %"
+               "verified?" "registered?" "最終評価日" "最終処理"]
+              (map (partial batch-row ledger) (store/all-batches db)))
+
+     (section "組立・試験設備 (SSoT)"
+              (str "設備台帳。未検証・未登録の設備に対する保守作業予定は "
+                   "<code>equipment-not-verified</code> で HARD hold になります。"
+                   "<code>最終予定日</code> は保守作業予定のコミットが書き戻した値です。")
+              ["設備" "種別" "verified?" "registered?" "最終保守日" "最終予定日"]
+              (map equipment-row (store/all-equipment db)))
+
+     (section "保守作業予定ドラフト"
+              (str "コミット済みの保守作業予定。<code>otherelecmfg.registry/register-maintenance</code> が"
+                   "採番した <code>maintenance-number</code> 付き。実際の設備には一切触れていません "
+                   "(ドラフト記録のみ)。")
+              ["予定 ID" "設備" "作業種別" "予定日" "採番" "scheduled?" "承認者"]
+              (map (partial maintenance-row approvals) (store/all-maintenance db)))
+
+     (section "出荷調整ドラフト"
+              (str "コミット済みの出荷調整。数量は governor が batch の "
+                   "<code>quantity-units</code> と <code>shipped-units</code> から独立に検算しており、"
+                   "申請値をそのまま信用していません。<code>ship-2</code> は残数ちょうどの出荷 "
+                   "&mdash; ぴったり充填は超過ではない、という境界の実例です。")
+              ["出荷 ID" "バッチ" "数量" "宛先" "採番" "承認者"]
+              (map (partial shipment-row approvals) shipments))
+
+     (section "安全懸念ログ"
+              (str "追記のみの安全懸念ログ。<code>:flag-safety-concern</code> は "
+                   "<code>:coordination/safety-concern</code> stake により confidence に関わらず"
+                   "常に人間へエスカレーションします (どの phase の <code>:auto</code> にも入りません)。"
+                   "却下された懸念は SSoT に入らないため、この表には現れません。")
+              ["懸念 ID" "設備" "深刻度" "内容" "承認者"]
+              (map (partial concern-row approvals) (store/safety-concerns db)))
+
+     (section "承認者の帰属 (走行時に導出)"
+              (str "この節はハードコードされた注記ではなく、実際のレジスタを走査した結果です。"
+                   "承認経路は承認者を <code>[:record :payload :approved-by]</code> に載せますが、"
+                   "<code>otherelecmfg.store/commit-record!</code> は "
+                   "<code>{:keys [effect path value]}</code> しか分解せず <code>:payload</code> を読みません。"
+                   "そのため今回、監査ファクトが承認者を保持している件数 "
+                   "<span class=\"num\">" in-audit "</span> に対し、"
+                   "レジスタが保持している件数は <span class=\"num\">" in-record "</span> です。"
+                   (if (zero? in-record)
+                     (str "<strong>承認者は SSoT に残っていません</strong> "
+                          "&mdash; 「誰も承認していない」ことと区別できるよう、上表では監査ファクト由来と"
+                          "明示して併記しています。この seam が直れば、この数値と表示は自動的に変わります。")
+                     "レジスタが承認者を保持しています。"))
+              ["対象" "種別" "監査ファクトの承認者" "レジスタ内 :approved-by"]
+              (map (fn [{:keys [id] :as e}]
+                     (row (str "<code>" (esc id) "</code>")
+                          (cond (contains? e :maintenance-number) "保守作業予定"
+                                (contains? e :shipment-number) "出荷調整"
+                                :else "安全懸念")
+                          (str "<span class=\"ok\">" (esc (get approvals id)) "</span>")
+                          (if (contains? e :approved-by)
+                            (str "<span class=\"ok\">" (esc (:approved-by e)) "</span>")
+                            "<span class=\"critical\">保持されていない</span>")))
+                   approved-entities))
+
+     (section "段階的ロールアウト (otherelecmfg.phase)"
+              (str "この表は <code>otherelecmfg.phase/phases</code> そのものを読み出して描画しています "
+                   "(手書きの方針文ではありません)。<code>:schedule-maintenance</code> は phase 3 を含む"
+                   "どの段階の <code>:auto</code> にも入っていません &mdash; 保守作業予定は常に人間の判断です。"
+                   "この不変条件はビルド時に検査され、破れると生成が失敗します。")
+              ["phase" "ラベル" "書き込み可能な op" "自動コミット可能な op"]
+              (map phase-row (sort-by key phase/phases)))
+
+     (section "発火した governor HARD 規則"
+              (str "今回の走行で実際に発火した規則のみを、governor 自身が出力した "
+                   "<code>:detail</code> 文字列とともに列挙しています。宣言済みの "
+                   "<span class=\"num\">" (count declared-hard-rules) "</span> 規則すべてが"
+                   "発火しない限り、このページは生成されません。"
+                   "HARD hold は人間承認では上書きできません。")
+              ["規則" "発火回数" "対象" "governor の判定文"]
+              (map rule-row coverage))
+
+     (section "シナリオ走行 (langgraph StateGraph)"
+              (str "各行が 1 回のグラフ走行 (<code>langgraph.graph/run*</code>) です。"
+                   "<code>escalate</code> は <code>interrupt-before #{:request-approval}</code> による"
+                   "人間への引き渡しで、再開時に承認/却下されます。")
+              ["thread" "シナリオ" "op" "対象" "最終 disposition" "台帳上の最終処理"]
+              (map (partial run-row ledger) runs))
+
+     (section "監査台帳 (追記のみ)"
+              (str "コミット・保留・却下のすべてが不変の決定ファクトとして残ります。"
+                   "SSoT を書き換えるノードは <code>:commit</code> ただ 1 つで、"
+                   "HARD hold は SSoT を一切変更しません。")
+              ["ファクト" "op" "対象" "disposition" "根拠 / 段階ゲート理由" "confidence"]
+              (map ledger-row ledger))
+
+     (section "不変ドラフト記録 (otherelecmfg.registry)"
+              (str "<code>register-maintenance</code> / <code>register-shipment</code> が構築した"
+                   "ドラフト記録。付随する証明書はすべて <code>draft-unsigned</code> / "
+                   "<code>issued_by_registry: false</code> です &mdash; この actor は電気安全認証機関では"
+                   "ありません。")
+              ["record_id" "種別" "対象 ID" "設備" "immutable"]
+              (map draft-row (concat (store/maintenance-history db) (store/shipment-history db))))
+
+     "</main>\n"
+     "<footer>\n"
+     "  <p>cloud-itonami-isic-2790 &middot; ISIC 2790 電気機器その他の製造 &mdash; "
+     "この actor が行わないこと: 組立・試験設備の直接操作、実際の貨物手配、電気安全認証 "
+     "(UL/CE/IEC 等) の発行。詳細は README と <code>docs/adr/0001-architecture.md</code>。</p>\n"
+     "  <p>生成: <code>clojure -M:dev:render-html</code> &middot; "
+     "決定的出力 (タイムスタンプ・乱数なし)。</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+;; ----------------------------- build-time invariants -----------------------------
+
+(defn- check!
+  "A page that claims something the run did not produce is a fake, so
+  every claim the document makes is asserted here and the build FAILS
+  rather than emit it."
+  [{:keys [db runs]}]
+  (let [ledger (vec (store/ledger db))
+        facts (audit-facts runs)
+        hold-facts (holds db)
+        fired (set (keys (rule-coverage db)))
+        missing (remove fired declared-hard-rules)
+        equipment-ids (set (map :id (store/all-equipment db)))
+        batch-ids (set (map :id (store/all-batches db)))]
+
+    (when (empty? hold-facts)
+      (throw (ex-info "render-html: 走行が :governor-hold を 1 件も生成していない -- HARD hold を実演しないコンソールは出力しない"
+                      {:ledger-count (count ledger)})))
+
+    (when (seq missing)
+      (throw (ex-info "render-html: 宣言済みの HARD 規則のうち発火しなかったものがある -- ページの網羅性の主張が嘘になる"
+                      {:missing (vec missing) :fired (vec (sort-by name fired))})))
+
+    (when-not (some #(= :committed (:t %)) ledger)
+      (throw (ex-info "render-html: コミットが 1 件も無い -- 承認経路を実演できていない" {})))
+
+    (when-not (some #(= :approval-granted (:t %)) facts)
+      (throw (ex-info "render-html: 承認 (:approval-granted) が 1 件も無い" {})))
+
+    (when-not (some #(= :approval-rejected (:t %)) ledger)
+      (throw (ex-info "render-html: 承認却下 (:approval-rejected) が 1 件も無い" {})))
+
+    (when-not (some :phase-reason hold-facts)
+      (throw (ex-info "render-html: 段階ロールアウトゲートによる保留が 1 件も無い" {})))
+
+    ;; `otherelecmfg.phase` の恒久的不変条件 -- 保守作業予定はどの段階でも自動化されない。
+    (when (some #(contains? (:auto %) :schedule-maintenance) (vals phase/phases))
+      (throw (ex-info "render-html: :schedule-maintenance がいずれかの phase の :auto に入っている -- ページのこの主張が崩れた"
+                      {:phases (into (sorted-map) (map (juxt key (comp :auto val)) phase/phases))})))
+
+    ;; トレーサビリティ -- 描画するドラフトが参照する id はすべて store に実在すること。
+    (doseq [m (store/all-maintenance db)]
+      (when-not (contains? equipment-ids (:equipment-id m))
+        (throw (ex-info "render-html: 保守作業予定が store に存在しない設備を参照している"
+                        {:maintenance (:id m) :equipment-id (:equipment-id m)
+                         :known equipment-ids}))))
+    (doseq [sid (map #(get % "shipment_id") (store/shipment-history db))
+            :let [s (store/shipment db sid)]]
+      (when-not (contains? batch-ids (:batch-id s))
+        (throw (ex-info "render-html: 出荷調整が store に存在しないバッチを参照している"
+                        {:shipment sid :batch-id (:batch-id s) :known batch-ids}))))
+
+    {:runs (count runs) :ledger (count ledger) :holds (count hold-facts)
+     :rules (count fired) :commits (count (filter #(= :committed (:t %)) ledger))}))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        result (run-demo!)
+        stats (check! result)
+        html (render result)]
+    (spit out html)
+    (println "wrote" out (str "(" (count html) " bytes)"))
+    (println "  scenarios:" (:runs stats)
+             "| ledger facts:" (:ledger stats)
+             "| commits:" (:commits stats)
+             "| HARD holds:" (:holds stats)
+             "| governor rules fired:" (:rules stats))))
