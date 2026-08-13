@@ -11,7 +11,13 @@
  :deps {io.github.kotoba-lang/langgraph
         {:local/root "../../kotoba-lang/langgraph"}
         io.github.kotoba-lang/langchain
-        {:local/root "../../kotoba-lang/langchain"}}
+        {:local/root "../../kotoba-lang/langchain"}
+        ;; デジタル庁デザインシステム(DADS) -- docs/samples/operator-console.html
+        ;; の <style> に流し込む共有スキン。git 座標なので monorepo の外の
+        ;; fork でも解決する (:local/root と違い workspace 非依存)。
+        io.github.kotoba-lang/jp-go-digital-design-system
+        {:git/url "https://github.com/kotoba-lang/jp-go-digital-design-system"
+         :git/sha "83db99546eabc53613ae826ea41d1533a3c574af"}}
  :aliases
  {;; offline workspace dev -- pin transitive langchain to local checkout
   ;; (kept for parity with sibling actors' deps.edn shape; redundant
@@ -21,6 +27,11 @@
          {:local/root "../../kotoba-lang/langchain"}}}
   ;; clojure -M:dev:run  -> drive the demo through one OperationActor
   :run {:main-opts ["-m" "otherelecmfg.sim"]}
+  ;; clojure -M:dev:render-html [out-file] -> regenerate
+  ;; docs/samples/operator-console.html by driving the REAL actor
+  ;; (operation -> governor -> store) at build time. Fails loudly if the
+  ;; run does not actually produce the holds/approvals the page claims.
+  :render-html {:main-opts ["-m" "otherelecmfg.render-html"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
