@@ -2472,7 +2472,7 @@ img,svg { max-width: 100%; height: auto; }
   <span class="badge">read-only サンプル &middot; governor-gated &middot; 設備の直接操作と認証自己発行は恒久禁止</span>
 </header>
 <main>
-  <p class="subtitle">このページは <code>clojure -M:dev:render-html</code> が実際の actor (<code>otherelecmfg.operation</code> &rarr; <code>otherelecmfg.governor</code> &rarr; <code>otherelecmfg.store</code>) を langgraph StateGraph 上で走らせ、その出力だけから生成しています。手書きの数値・固有名は 1 つもありません。今回の走行: <span class="num">20</span> シナリオ / <span class="num">5</span> コミット / <span class="num">14</span> HARD hold / <span class="num">12</span> 種の governor 規則が発火。</p>
+  <p class="subtitle">このページは <code>kbb -M:dev:render-html</code> が実際の actor (<code>otherelecmfg.operation</code> &rarr; <code>otherelecmfg.governor</code> &rarr; <code>otherelecmfg.store</code>) を langgraph StateGraph 上で走らせ、その出力だけから生成しています。手書きの数値・固有名は 1 つもありません。今回の走行: <span class="num">20</span> シナリオ / <span class="num">5</span> コミット / <span class="num">14</span> HARD hold / <span class="num">12</span> 種の governor 規則が発火。</p>
   <section class="card">
     <h2>生産バッチ (SSoT)</h2>
     <p class="muted"><code>otherelecmfg.store</code> の生産バッチ台帳。<code>verified?</code>/<code>registered?</code> は QC 検査済み・生産台帳登録済みの実facts で、governor が助言者の言い分を信用せず独立に読み直す対象です。<code>shipped-units</code> は走行後の値 (出荷コミットで実際に増えています)。</p>
@@ -2647,6 +2647,6 @@ img,svg { max-width: 100%; height: auto; }
 </main>
 <footer>
   <p>cloud-itonami-isic-2790 &middot; ISIC 2790 電気機器その他の製造 &mdash; この actor が行わないこと: 組立・試験設備の直接操作、実際の貨物手配、電気安全認証 (UL/CE/IEC 等) の発行。詳細は README と <code>docs/adr/0001-architecture.md</code>。</p>
-  <p>生成: <code>clojure -M:dev:render-html</code> &middot; 決定的出力 (タイムスタンプ・乱数なし)。</p>
+  <p>生成: <code>kbb -M:dev:render-html</code> &middot; 決定的出力 (タイムスタンプ・乱数なし)。</p>
 </footer>
 </body></html>
