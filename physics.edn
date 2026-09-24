@@ -1,0 +1,33 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README: the ISIC 2790 plant assembles other electrical equipment --
+;; electric welding and soldering equipment, resistors and capacitors n.e.c.
+;; -- and tests it (including insulation resistance) before shipment. The
+;; robots' physical work: the heat-run test of a welding power source's
+;; transformer winding, and lifting the finished power source onto the test
+;; bench.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-2790"
+ :cases
+ [{:id :welder-transformer-heat-run
+   :kind :thermal
+   :procedure "heat-run of a welding transformer: a 40 mm winding stack dissipates copper loss at a continuous load, fan air at 40 C on one face, the opposite face adiabatic (hot spot)"
+   :params {:thickness-m 0.040 :conductivity-w-mk 1.2 :density-kg-m3 6000.0 :specific-heat-j-kgk 500.0
+            :t0-c 40.0 :t-hot-c 40.0 :h-front-w-m2k 40.0 :h-back-w-m2k 0.0
+            :threshold-c 180.0 :duration-s 28800.0 :nodes 7}
+   :sweep {:param :q-gen-w-m3 :values [20000.0 40000.0 60000.0 80000.0 100000.0]}
+   :quantity :peak-back-c
+   :limit {:max 180.0 :basis "IEC 60085 thermal class 180 (H) for the winding insulation; the stack's effective conductivity, the fan-side h and the 40 C cooling-air temperature are estimates"}
+   :boundary {:lo 10000.0 :hi 150000.0}}
+  {:id :power-source-onto-bench
+   :kind :manipulator
+   :procedure "heavy-payload arm lifts a finished welding power source from the assembly line onto the insulation-resistance test bench"
+   :params {:l1-m 0.80 :l2-m 0.70 :m1-kg 20.0 :m2-kg 12.0
+            :from [0.95 0.05] :to [0.45 0.70] :duration-s 3.0 :steps 400}
+   :sweep {:param :payload-kg :values [8.0 15.0 25.0 35.0 50.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 600.0 :basis "estimate: continuous shoulder torque of a ~50 kg-class industrial arm"}
+   :boundary {:lo 1.0 :hi 150.0}}]}
