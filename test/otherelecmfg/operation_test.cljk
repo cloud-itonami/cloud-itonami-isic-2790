@@ -4,7 +4,7 @@
   contract (HARD holds, escalation, phase gating) is exercised in
   `otherelecmfg.governor-contract-test`; the Store contract in
   `otherelecmfg.store-contract-test`."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [langgraph.graph :as g]
             [otherelecmfg.operation :as op]
             [otherelecmfg.store :as store]))
