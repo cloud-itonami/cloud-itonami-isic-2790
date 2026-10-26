@@ -37,7 +37,7 @@
        io.github.kotoba-lang/langgraph
         {:local/root "../../kotoba-lang/kotoba/lib/kotoba.langgraph"}
         io.github.kotoba-lang/langchain
-        {:local/root "../../kotoba-lang/langchain"}
+        {:local/root "../../kotoba-lang/kotoba/lib/kotoba.langchain"}
         ;; デジタル庁デザインシステム(DADS) -- docs/samples/operator-console.html
         ;; の <style> に流し込む共有スキン。git 座標なので monorepo の外の
         ;; fork でも解決する (:local/root と違い workspace 非依存)。
@@ -58,7 +58,7 @@
   ;; with the top-level :deps override above).
   :dev {:override-deps
         {io.github.kotoba-lang/langchain
-         {:local/root "../../kotoba-lang/langchain"}}}
+        {:local/root "../../kotoba-lang/kotoba/lib/kotoba.langchain"}}}
   ;; kbb -M:dev:run  -> drive the demo through one OperationActor
   :run {:main-opts ["-m" "otherelecmfg.sim"]}
   ;; kbb -M:dev:render-html [out-file] -> regenerate
